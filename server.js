@@ -100,5 +100,4 @@ app.get('/', (req, res) => {
     res.send('<h1>SpeedBrowser Headless Proxy Engine</h1><p>Active with JavaScript & HTML5 Rendering support.</p>');
 });
 
-app.listen(PORT, () => console.log(`Server live 
-on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server live on port ${PORT}`));
