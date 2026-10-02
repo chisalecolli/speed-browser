@@ -1,29 +1,10 @@
 const express = require('express');
+const axios = require('axios');
 const cheerio = require('cheerio');
-const puppeteer = require('puppeteer');
+const { Window } = require('happy-dom');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-let browser = null;
-
-// Initialize headless Chromium instance
-async function getBrowser() {
-    if (!browser) {
-        browser = await puppeteer.launch({
-            headless: 'new',
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--disable-gpu',
-                '--single-process'
-            ]
-        });
-    }
-    return browser;
-}
 
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -41,42 +22,42 @@ app.get('/render', async (req, res) => {
         targetUrl = 'http://' + targetUrl;
     }
 
-    let page = null;
     try {
-        const browserInstance = await getBrowser();
-        page = await browserInstance.newPage();
+        // 1. Fetch raw HTML content
+        const response = await axios.get(targetUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SpeedBrowser/1.0'
+            },
+            timeout: 8000
+        });
 
-        // Block heavy media (video/fonts) to save proxy RAM & speed up load times
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            const resourceType = req.resourceType();
-            if (resourceType === 'media' || resourceType === 'font') {
-                req.abort();
-            } else {
-                req.continue();
+        // 2. Initialize lightweight virtual DOM engine
+        const window = new Window({
+            url: targetUrl,
+            settings: {
+                disableJavaScriptEvaluation: false, // Enable JavaScript execution
+                disableCSSFileLoading: true,        // Skip heavy CSS downloads to save bandwidth
+                disableIframePageLoading: true
             }
         });
 
-        // 1. Load URL and execute client JavaScript
-        await page.goto(targetUrl, {
-            waitUntil: 'domcontentloaded',
-            timeout: 12000
-        });
+        const document = window.document;
+        document.write(response.data);
 
-        // Wait 1.5s for dynamic SPA/React/Vue scripts to render DOM
-        await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1500)));
+        // Wait brief moment for dynamic client scripts to execute
+        await new Promise(resolve => setTimeout(resolve, 500));
 
-        // 2. Extract final rendered HTML DOM
-        const renderedHtml = await page.content();
-        await page.close();
+        // 3. Get rendered HTML snapshot and close virtual window
+        const renderedHtml = document.documentElement.outerHTML;
+        window.close();
 
-        // 3. Clean and optimize DOM for J2ME feature phone
+        // 4. Optimize and strip heavy elements for J2ME output
         const $ = cheerio.load(renderedHtml);
 
-        $('script').remove();   // Remove scripts now that execution is complete
-        $('iframe').remove();   // Strip third-party frames/ads$('svg').remove();
+        $('script').remove();$('iframe').remove();
+        $('svg').remove();$('noscript').remove();
 
-        // Convert links to route back through our proxy
+        // Rewrite relative links to funnel through Render proxy
         $('a').each((_, el) => {
             const href = $(el).attr('href');
             if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
@@ -91,13 +72,12 @@ app.get('/render', async (req, res) => {
         res.send($.html());
 
     } catch (error) {
-        if (page) await page.close().catch(() => {});
-        res.status(500).send(`<h3>Render Error</h3><p>Could not process page: ${error.message}</p>`);
+        res.status(500).send(`<h3>Proxy Error</h3><p>Could not render <b>${targetUrl}</b>: ${error.message}</p>`);
     }
 });
 
 app.get('/', (req, res) => {
-    res.send('<h1>SpeedBrowser Headless Proxy Engine</h1><p>Active with JavaScript & HTML5 Rendering support.</p>');
+    res.send('<h1>SpeedBrowser Proxy Active</h1><p>Usage: <code>/render?url=http://example.com</code></p>');
 });
 
-app.listen(PORT, () => console.log(`Server live on port ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy listening on port ${PORT}`));
