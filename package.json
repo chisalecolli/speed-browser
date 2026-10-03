@@ -1,7 +1,6 @@
 {
   "name": "speedbrowser-proxy",
   "version": "1.0.0",
-  "description": "Proxy server for J2ME SpeedBrowser",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,7 +9,7 @@
     "axios": "^1.6.0",
     "cheerio": "^1.0.0-rc.12",
     "express": "^4.18.2",
-    "sharp": "^0.33.0"
+    "jimp": "^0.22.10"
   },
   "engines": {
     "node": ">=18.0.0"
