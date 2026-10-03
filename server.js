@@ -1,78 +1,140 @@
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { JSDOM } = require('jsdom');
+const sharp = require('sharp');
+const { URL } = require('url');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SERVER_BASE_URL = process.env.SERVER_BASE_URL || `http://localhost:${PORT}`;
 
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    next();
-});
+// User-Agent to mimic a standard browser when fetching target sites
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+// -----------------------------------------------------------------------------
+// 1. HTML & CSS RENDER ENDPOINT (/render?url=...)
+// -----------------------------------------------------------------------------
 app.get('/render', async (req, res) => {
-    let targetUrl = req.query.url;
+    const targetUrl = req.query.url;
 
     if (!targetUrl) {
-        return res.status(400).send('<h3>Error: Missing target URL parameter.</h3>');
-    }
-
-    if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-        targetUrl = 'http://' + targetUrl;
+        return res.status(400).send('Missing "url" parameter');
     }
 
     try {
-        // 1. Fetch raw web page content
+        // Fetch target webpage HTML
         const response = await axios.get(targetUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SpeedBrowser/1.0'
-            },
+            headers: { 'User-Agent': USER_AGENT },
             timeout: 10000
         });
 
-        // 2. Initialize Virtual JSDOM engine and execute inline scripts
-        const dom = new JSDOM(response.data, {
-            url: targetUrl,
-            runScripts: "dangerously", // Allows execution of inline page JS
-            virtualConsole: new (require('jsdom').VirtualConsole)() // Mutes external console noise
+        const $ = cheerio.load(response.data);
+
+        // Strip non-renderable & heavy elements
+        $('script, style, iframe, svg, noscript, video, audio, source, canvas').remove();
+
+        // --- CSS & STYLE EXTRACTION ---
+        // Convert headings to simplified structured tags
+        $('h1, h2, h3, h4, h5, h6').each((_, el) => {
+            const level = el.tagName.toLowerCase();
+            const text = $(el).text().trim();$(el).replaceWith(`<${level}>${text}</${level}><br>`);
         });
 
-        // Short pause to allow DOM scripts to update layout
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Extract basic CSS text colors and background styling
+        $('[style]').each((_, el) => {
+            const style = $(el).attr('style') || '';
+            
+            // Extract text color (hex or rgb)
+            const colorMatch = style.match(/color\s*:\s*(#[0-9a-fA-F]{3,6}|rgb\([^)]+\))/);
+            if (colorMatch) {
+                $(el).attr('data-color', colorMatch[1]);
+            }
 
-        // 3. Extract updated DOM HTML
-        const renderedHtml = dom.serialize();
-        dom.window.close();
-
-        // 4. Strip heavy elements and clean output for J2ME client
-        const $ = cheerio.load(renderedHtml);
-
-        $('script').remove();$('iframe').remove();
-        $('svg').remove();$('noscript').remove();
-
-        // Rewrite links to stay within proxy engine
-        $('a').each((_, el) => {
-            const href = $(el).attr('href');
-            if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-                try {
-                    const resolved = new URL(href, targetUrl).href;
-                    $(el).attr('href', `/render?url=${encodeURIComponent(resolved)}`);
-                } catch (e) {}
+            // Extract background color
+            const bgMatch = style.match(/background(-color)?\s*:\s*(#[0-9a-fA-F]{3,6}|rgb\([^)]+\))/);
+            if (bgMatch) {
+                $(el).attr('data-bg', bgMatch[1]);
             }
         });
 
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.send($.html());
+        // --- IMAGE PROXYING & DOWNSCALING ---
+        $('img').each((_, el) => {
+            let src = $(el).attr('src') \vert{}\vert{}$(el).attr('data-src');
+            if (!src) {
+                $(el).remove();
+                return;
+            }
 
-    } catch (error) {
-        res.status(500).send(`<h3>Proxy Error</h3><p>Could not render page: ${error.message}</p>`);
+            // Resolve relative URLs to absolute URLs
+            try {
+                src = new URL(src, targetUrl).href;
+            } catch (e) {
+                $(el).remove();
+                return;
+            }
+
+            // Replace original image URL with our server's downscaling proxy route
+            // Max width set to 220px to fit standard J2ME screens (240x320 or 176x220)
+            const proxyImgUrl = `${SERVER_BASE_URL}/image?url=${encodeURIComponent(src)}&width=220`;
+            
+            const altText = $(el).attr('alt') \vert{}\vert{} 'Image';$(el).replaceWith(`<img src="${proxyImgUrl}" alt="${altText}">`);
+        });
+
+        // Clean output HTML
+        const cleanedHtml = $.html();
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.send(cleanedHtml);
+
+    } catch (err) {
+        res.status(500).send(`Proxy Error: ${err.message}`);
     }
 });
 
-app.get('/', (req, res) => {
-    res.send('<h1>SpeedBrowser Proxy Active</h1><p>Usage: <code>/render?url=http://example.com</code></p>');
+// -----------------------------------------------------------------------------
+// 2. IMAGE DOWNSCALING & TRANSCODING ENDPOINT (/image?url=...&width=220)
+// -----------------------------------------------------------------------------
+app.get('/image', async (req, res) => {
+    const imageUrl = req.query.url;
+    const maxWidth = parseInt(req.query.width) || 220; // Default max 220px width
+
+    if (!imageUrl) {
+        return res.status(400).send('Missing "url" parameter');
+    }
+
+    try {
+        // Fetch raw image binary stream
+        const response = await axios.get(imageUrl, {
+            responseType: 'arraybuffer',
+            headers: { 'User-Agent': USER_AGENT },
+            timeout: 8000
+        });
+
+        const imageBuffer = Buffer.from(response.data);
+
+        // Process image with Sharp:
+        // 1. Convert WebP/AVIF/SVG/GIF to standard JPEG (supported by J2ME MIDP 2.0 LCDUI)
+        // 2. Downscale width to phone screen dimensions preserving aspect ratio
+        // 3. Compress to reduce cellular data usage (GPRS/EDGE friendly)
+        const processedImage = await sharp(imageBuffer)
+            .resize({ width: maxWidth, fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 65, progressive: false }) // Baseline JPEG for old handsets
+            .toBuffer();
+
+        res.setHeader('Content-Type', 'image/jpeg');
+        res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 24 hours
+        res.send(processedImage);
+
+    } catch (err) {
+        // Fallback: Return a 1x1 transparent PNG if image processing or fetching fails
+        const emptyPng = Buffer.from(
+            'iVBORw0KGgoAAAANSUEngineAAAABJRU5ErkJggg==',
+            'base64'
+        );
+        res.setHeader('Content-Type', 'image/png');
+        res.send(emptyPng);
+    }
 });
 
-app.listen(PORT, () => console.log(`Proxy listening on 
-port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`SpeedBrowser Proxy Server running on port ${PORT}`);
+});
